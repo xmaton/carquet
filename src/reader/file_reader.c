@@ -656,6 +656,53 @@ carquet_reader_t* carquet_reader_open_file(
     return reader;
 }
 
+carquet_reader_t* carquet_reader_open_shared(
+    const carquet_reader_t* base,
+    const char* path,
+    const carquet_reader_options_t* options,
+    carquet_error_t* error) {
+
+    /* base and path are nonnull per API contract */
+    carquet_reader_t* reader = carquet_mem_calloc(1, sizeof(carquet_reader_t));
+    if (!reader) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate reader");
+        return NULL;
+    }
+
+    if (options) {
+        reader->options = *options;
+    } else {
+        carquet_reader_options_init(&reader->options);
+    }
+    reader->options.use_mmap = false;
+
+    FILE* file = carquet_fopen(path, "rb");
+    if (!file) {
+        carquet_mem_free(reader);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN, "Failed to open file: %s", path);
+        return NULL;
+    }
+    if (carquet_fseek64(file, 0, SEEK_END) != 0 || carquet_ftell64(file) != (int64_t)base->file_size) {
+        fclose(file);
+        carquet_mem_free(reader);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_OPEN,
+            "Not the file the base reader reads (its size differs): %s", path);
+        return NULL;
+    }
+
+    /* The metadata and the schema are base's, in its arena; this reader's arena
+     * stays empty, so closing it frees nothing of them. */
+    reader->file = file;
+    reader->owns_file = true;
+    reader->file_size = base->file_size;
+    reader->metadata = base->metadata;
+    reader->schema = base->schema;
+    reader->prebuffer.row_group = -1;
+    reader->prebuffer.file_offset = -1;
+    reader->is_open = true;
+    return reader;
+}
+
 carquet_status_t carquet_get_file_info(
     const char* path,
     carquet_file_info_t* info,

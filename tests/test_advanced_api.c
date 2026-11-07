@@ -813,6 +813,59 @@ static int test_column_reader_reset(void) {
     return 0;
 }
 
+/* Readers sharing a base reader's metadata (carquet_reader_open_shared), over
+ * the file test_column_reader_reset wrote: each reads every row group, in its
+ * own order, interleaved with the other, without a prebuffer; the base reads
+ * too. Another file (a different size) is refused. */
+static int test_reader_open_shared(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_reader_t* base = carquet_reader_open(TEMP_FILE, NULL, &err);
+    if (!base) TEST_FAIL("reader_open_shared", err.message);
+    carquet_reader_t* a = carquet_reader_open_shared(base, TEMP_FILE, NULL, &err);
+    carquet_reader_t* b = carquet_reader_open_shared(base, TEMP_FILE, NULL, &err);
+    if (!a || !b) TEST_FAIL("reader_open_shared", err.message);
+    if (carquet_reader_num_row_groups(a) != RESET_RGS ||
+        carquet_reader_schema(a) != carquet_reader_schema(base))
+        TEST_FAIL("reader_open_shared", "metadata not the base's");
+
+    for (int step = 0; step < RESET_RGS; step++) {
+        int rgs[] = {step, RESET_RGS - 1 - step};
+        carquet_reader_t* rs[] = {a, b};
+        for (int k = 0; k < 2; k++) {
+            carquet_column_reader_t* c0 = carquet_reader_get_column(rs[k], rgs[k], 0, &err);
+            carquet_column_reader_t* c1 = carquet_reader_get_column(rs[k], rgs[k], 1, &err);
+            if (!c0 || !c1) TEST_FAIL("reader_open_shared", "get_column failed");
+            if (check_reset_rg(c0, c1, rgs[k]))
+                TEST_FAIL("reader_open_shared", "row group contents mismatch");
+            carquet_column_reader_free(c0);
+            carquet_column_reader_free(c1);
+        }
+    }
+    carquet_column_reader_t* c0 = carquet_reader_get_column(base, 1, 0, &err);
+    carquet_column_reader_t* c1 = carquet_reader_get_column(base, 1, 1, &err);
+    if (!c0 || !c1 || check_reset_rg(c0, c1, 1))
+        TEST_FAIL("reader_open_shared", "base mismatch");
+    carquet_column_reader_free(c0);
+    carquet_column_reader_free(c1);
+
+    char other[512];
+    carquet_test_temp_path(other, sizeof(other), "test_advanced_api_other");
+    FILE* f = fopen(other, "wb");
+    if (!f || fwrite("PAR1", 1, 4, f) != 4 || fclose(f) != 0)
+        TEST_FAIL("reader_open_shared", "cannot write the other file");
+    carquet_error_t e = CARQUET_ERROR_INIT;
+    if (carquet_reader_open_shared(base, other, NULL, &e) != NULL ||
+        e.code != CARQUET_ERROR_FILE_OPEN)
+        TEST_FAIL("reader_open_shared", "another file accepted");
+    remove(other);
+
+    carquet_reader_close(a);
+    carquet_reader_close(b);
+    carquet_reader_close(base);
+    TEST_PASS("reader_open_shared");
+    return 0;
+}
+
 int main(void) {
     carquet_init();
     int failures = 0;
@@ -827,6 +880,7 @@ int main(void) {
     failures += test_read_batch_ex();
     failures += test_type_mismatch_rejected();
     failures += test_column_reader_reset();
+    failures += test_reader_open_shared(); /* over the file the one above wrote */
 
     remove(TEMP_FILE);
 

@@ -1409,6 +1409,36 @@ carquet_reader_t* carquet_reader_open_buffer(
     carquet_error_t* error);
 
 /**
+ * @brief Open another reader of the file another reader reads, sharing its metadata.
+ *
+ * Opens @p path, the file @p base reads, with a file handle, a pre-buffer and
+ * reading state of its own, but borrows @p base's parsed metadata and schema
+ * instead of reading and parsing the footer again. Readers of one file on
+ * several threads, one reader a thread, then parse its footer once.
+ *
+ * Uses the fread path (options' use_mmap is ignored). The file must be the
+ * one @p base read: its size is checked against @p base's.
+ *
+ * @param[in] base Open reader of the same file; read only. It must stay open
+ *                 until the returned reader is closed.
+ * @param[in] path File path (must be null-terminated)
+ * @param[in] options Reader options (may be NULL for defaults)
+ * @param[out] error Error information (may be NULL)
+ * @return Reader handle, or NULL on error
+ *
+ * @note Thread-safe: Yes (base is only read; several threads may open shared
+ *       readers of the same base at once)
+ * @note The returned reader must be closed with carquet_reader_close(), before
+ *       @p base.
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 2)
+carquet_reader_t* carquet_reader_open_shared(
+    const carquet_reader_t* base,
+    const char* path,
+    const carquet_reader_options_t* options,
+    carquet_error_t* error);
+
+/**
  * @brief Close a reader and release all resources.
  *
  * Closes the file (if opened by carquet_reader_open) and frees all memory
