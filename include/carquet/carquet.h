@@ -1839,6 +1839,62 @@ carquet_status_t carquet_column_reader_reset(
     int32_t row_group_index,
     carquet_error_t* error);
 
+/**
+ * @brief Move a column reader to another row group, reading dictionary codes.
+ *
+ * As carquet_column_reader_reset(), but where the row group's chunk is
+ * dictionary-encoded (and not repeated), carquet_column_read_batch() then
+ * returns uint32_t codes into the chunk's dictionary
+ * (carquet_column_dictionary()) instead of the values they stand for: no
+ * value is gathered from the dictionary. *coded tells whether it does; where
+ * it does not, values are read as by carquet_column_reader_reset().
+ *
+ * A chunk may fall back to PLAIN pages part way through (a writer's, once its
+ * dictionary is full). A read reaching such a page stops before it with
+ * CARQUET_ERROR_INVALID_ENCODING, the codes before it read (a partial read,
+ * see carquet_column_read_batch_ex(); -1 if the page is the read's first),
+ * and the reader stays at that page: carquet_column_reader_materialize()
+ * then reads values from it on.
+ *
+ * @note Experimental (tritium's carquet branch).
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1, 3)
+carquet_status_t carquet_column_reader_reset_codes(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    bool* coded,
+    carquet_error_t* error);
+
+/**
+ * @brief Switch a column reader reading codes to reading values.
+ *
+ * From its next page on, carquet_column_read_batch() returns values, as
+ * after carquet_column_reader_reset(), until the reader is reset again. Only
+ * between pages, where a read stopped by a PLAIN page leaves it (see
+ * carquet_column_reader_reset_codes()); in the middle of a page it fails with
+ * CARQUET_ERROR_INVALID_STATE and changes nothing.
+ *
+ * @note Experimental (tritium's carquet branch).
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_status_t carquet_column_reader_materialize(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error);
+
+/**
+ * @brief The dictionary of a column reader's current row group.
+ *
+ * Its entries, as the column's fixed-width physical values side by side
+ * (INT32, INT64, FLOAT, DOUBLE; BYTE_ARRAY dictionaries are not laid out so),
+ * and their count; NULL and 0 until the chunk's dictionary page is read (by
+ * the first carquet_column_read_batch() of the row group). Valid until the
+ * reader moves to another row group or is freed.
+ *
+ * @note Experimental (tritium's carquet branch).
+ */
+CARQUET_API CARQUET_NONNULL(1, 2)
+const void* carquet_column_dictionary(const carquet_column_reader_t* reader, int32_t* count);
+
 /* ============================================================================
  * Batch Reader API
  * ============================================================================

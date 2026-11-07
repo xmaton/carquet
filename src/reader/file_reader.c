@@ -1221,9 +1221,53 @@ void carquet_column_reader_rebind(
 }
 
 
+static carquet_status_t column_reader_reset(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    bool codes,
+    carquet_error_t* error);
+
 carquet_status_t carquet_column_reader_reset(
     carquet_column_reader_t* reader,
     int32_t row_group_index,
+    carquet_error_t* error) {
+    /* Public column readers materialize values unless asked for codes. */
+    return column_reader_reset(reader, row_group_index, false, error);
+}
+
+carquet_status_t carquet_column_reader_reset_codes(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    bool* coded,
+    carquet_error_t* error) {
+    carquet_status_t status = column_reader_reset(reader, row_group_index, true, error);
+    *coded = status == CARQUET_OK && reader->preserve_dictionary;
+    return status;
+}
+
+carquet_status_t carquet_column_reader_materialize(
+    carquet_column_reader_t* reader,
+    carquet_error_t* error) {
+    /* A page decoded as codes and not read to its end would be read on as
+     * values: only between pages (where a rejected PLAIN page leaves it). */
+    if (reader->page_loaded && reader->page_values_read < reader->page_num_values) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE,
+            "Column reader is in the middle of a page");
+        return CARQUET_ERROR_INVALID_STATE;
+    }
+    reader->preserve_dictionary = false;
+    return CARQUET_OK;
+}
+
+const void* carquet_column_dictionary(const carquet_column_reader_t* reader, int32_t* count) {
+    *count = reader->has_dictionary ? reader->dictionary_count : 0;
+    return reader->has_dictionary ? reader->dictionary_data : NULL;
+}
+
+static carquet_status_t column_reader_reset(
+    carquet_column_reader_t* reader,
+    int32_t row_group_index,
+    bool codes,
     carquet_error_t* error) {
 
     carquet_reader_t* file_reader = reader->file_reader;
@@ -1257,9 +1301,8 @@ carquet_status_t carquet_column_reader_reset(
         return CARQUET_ERROR_INVALID_METADATA;
     }
 
-    /* Public column readers always materialize values (preserve = false). */
     carquet_column_reader_rebind(reader, file_reader, row_group_index,
-                                 column_index, false);
+                                 column_index, codes);
     return CARQUET_OK;
 }
 
