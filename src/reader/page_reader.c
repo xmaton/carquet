@@ -1470,6 +1470,60 @@ static carquet_status_t decode_phase3_values(
  * ============================================================================
  */
 
+/* A v1 page's repetition and definition levels, from *ptr on; *ptr is left at
+ * its values and *non_null_count is how many there are. */
+static carquet_status_t decode_v1_levels(
+    carquet_column_reader_t* reader,
+    const uint8_t** ptr,
+    size_t* remaining,
+    const parquet_data_page_header_t* header,
+    int32_t num_values,
+    int16_t* def_levels,
+    int16_t* rep_levels,
+    int32_t* non_null_count,
+    carquet_error_t* error) {
+
+    /* Decode repetition levels if needed */
+    if (reader->max_rep_level > 0 && rep_levels) {
+        int bit_width = bit_width_for_max(reader->max_rep_level);
+        carquet_status_t status = decode_v1_level_section(
+            ptr, remaining, header->repetition_level_encoding,
+            bit_width, num_values, rep_levels, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    } else if (rep_levels) {
+        memset(rep_levels, 0, num_values * sizeof(int16_t));
+    }
+
+    /* Count non-null values */
+    *non_null_count = num_values;
+
+    /* Decode definition levels if needed */
+    if (carquet_column_def_as_bits(reader) && reader->decoded_def_bits && !def_levels) {
+        carquet_status_t status = decode_v1_def_bits(
+            reader, ptr, remaining, header->definition_level_encoding,
+            num_values, non_null_count, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    } else if (reader->max_def_level > 0 && def_levels) {
+        int bit_width = bit_width_for_max(reader->max_def_level);
+        carquet_status_t status = decode_v1_level_section(
+            ptr, remaining, header->definition_level_encoding,
+            bit_width, num_values, def_levels, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+        *non_null_count = (int32_t)carquet_dispatch_count_non_nulls(
+            def_levels, num_values, reader->max_def_level);
+    } else if (def_levels) {
+        /* Set all to max level (all values present) - use SIMD dispatch */
+        carquet_dispatch_fill_def_levels(def_levels, num_values, reader->max_def_level);
+    }
+    return CARQUET_OK;
+}
+
 carquet_status_t carquet_read_data_page_v1(
     carquet_column_reader_t* reader,
     const uint8_t* page_data,
@@ -1490,47 +1544,12 @@ carquet_status_t carquet_read_data_page_v1(
         num_values = (int32_t)max_values;
     }
 
-    /* Decode repetition levels if needed */
-    if (reader->max_rep_level > 0 && rep_levels) {
-        int bit_width = bit_width_for_max(reader->max_rep_level);
-        carquet_status_t status = decode_v1_level_section(
-            &ptr, &remaining, header->repetition_level_encoding,
-            bit_width, num_values, rep_levels, error);
-        if (status != CARQUET_OK) {
-            return status;
-        }
-    } else if (rep_levels) {
-        memset(rep_levels, 0, num_values * sizeof(int16_t));
+    int32_t non_null_count;
+    carquet_status_t status = decode_v1_levels(reader, &ptr, &remaining, header, num_values,
+                                               def_levels, rep_levels, &non_null_count, error);
+    if (status != CARQUET_OK) {
+        return status;
     }
-
-    /* Count non-null values */
-    int32_t non_null_count = num_values;
-
-    /* Decode definition levels if needed */
-    if (carquet_column_def_as_bits(reader) && reader->decoded_def_bits && !def_levels) {
-        carquet_status_t status = decode_v1_def_bits(
-            reader, &ptr, &remaining, header->definition_level_encoding,
-            num_values, &non_null_count, error);
-        if (status != CARQUET_OK) {
-            return status;
-        }
-    } else if (reader->max_def_level > 0 && def_levels) {
-        int bit_width = bit_width_for_max(reader->max_def_level);
-        carquet_status_t status = decode_v1_level_section(
-            &ptr, &remaining, header->definition_level_encoding,
-            bit_width, num_values, def_levels, error);
-        if (status != CARQUET_OK) {
-            return status;
-        }
-        non_null_count = (int32_t)carquet_dispatch_count_non_nulls(
-            def_levels, num_values, reader->max_def_level);
-    } else if (def_levels) {
-        /* Set all to max level (all values present) - use SIMD dispatch */
-        carquet_dispatch_fill_def_levels(def_levels, num_values, reader->max_def_level);
-    }
-
-    /* Decode values based on encoding */
-    carquet_status_t status = CARQUET_OK;
 
     switch (header->encoding) {
         case CARQUET_ENCODING_PLAIN:
@@ -3118,6 +3137,153 @@ static carquet_status_t load_next_page_mmap(
  * ============================================================================
  */
 
+void carquet_column_set_lazy_values(carquet_column_reader_t* reader, bool on) {
+    reader->lazy_values = on;
+}
+
+/* Whether a v1 page's values can be decoded as read (carquet_column_set_lazy_values). */
+static bool lazy_page_supported(const carquet_column_reader_t* reader, carquet_encoding_t encoding) {
+    if (!reader->lazy_values || reader->preserve_dictionary || reader->max_rep_level > 0) {
+        return false;
+    }
+    if (encoding == CARQUET_ENCODING_PLAIN) {
+        return reader->type == CARQUET_PHYSICAL_BYTE_ARRAY;
+    }
+    if ((encoding != CARQUET_ENCODING_RLE_DICTIONARY && encoding != CARQUET_ENCODING_PLAIN_DICTIONARY) ||
+        !reader->has_dictionary) {
+        return false;
+    }
+    switch (reader->type) {
+        case CARQUET_PHYSICAL_INT32:
+        case CARQUET_PHYSICAL_INT64:
+        case CARQUET_PHYSICAL_FLOAT:
+        case CARQUET_PHYSICAL_DOUBLE:
+            return true;
+        case CARQUET_PHYSICAL_BYTE_ARRAY:
+            return reader->dictionary_offsets != NULL;
+        default:
+            return false;
+    }
+}
+
+/* Decode a v1 page's levels and leave its values at a cursor, to be decoded as read. */
+static carquet_status_t start_lazy_page_v1(
+    carquet_column_reader_t* reader,
+    const uint8_t* page_data,
+    size_t page_size,
+    const parquet_data_page_header_t* header,
+    carquet_error_t* error) {
+
+    const uint8_t* ptr = page_data;
+    size_t remaining = page_size;
+    int32_t non_null;
+    carquet_status_t status = decode_v1_levels(reader, &ptr, &remaining, header, header->num_values,
+                                               reader->decoded_def_levels, reader->decoded_rep_levels,
+                                               &non_null, error);
+    if (status != CARQUET_OK) {
+        return status;
+    }
+    if (header->encoding != CARQUET_ENCODING_PLAIN) {
+        if (remaining < 1) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Missing bit width");
+            return CARQUET_ERROR_DECODE;
+        }
+        if (ptr[0] > 32) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE,
+                "Dictionary index bit width %d exceeds 32", ptr[0]);
+            return CARQUET_ERROR_DECODE;
+        }
+        carquet_rle_decoder_init(&reader->lazy_rle, ptr + 1, remaining - 1, ptr[0]);
+    }
+    reader->lazy_encoding = header->encoding;
+    reader->lazy_data = ptr;
+    reader->lazy_size = remaining;
+    reader->lazy_pos = 0;
+    reader->lazy_next = 0;
+    reader->lazy_count = non_null;
+    reader->page_lazy = true;
+    return CARQUET_OK;
+}
+
+/* Dense values [first, first + count) of a lazy page into out; reads only move forward. */
+static carquet_status_t read_lazy_values(
+    carquet_column_reader_t* reader,
+    int32_t first,
+    int32_t count,
+    void* out,
+    carquet_error_t* error) {
+
+    if (first < reader->lazy_next || count > reader->lazy_count - first) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "Lazy page read out of order");
+        return CARQUET_ERROR_INVALID_STATE;
+    }
+    int32_t skip = first - reader->lazy_next;
+    if (reader->lazy_encoding == CARQUET_ENCODING_PLAIN) {
+        const uint8_t* p = reader->lazy_data;
+        size_t size = reader->lazy_size;
+        size_t pos = reader->lazy_pos;
+        for (int32_t i = 0; i < skip; i++) {
+            if (size - pos < 4) {
+                goto truncated;
+            }
+            uint32_t len = carquet_read_u32_le(p + pos);
+            pos += 4;
+            if (len > size - pos) {
+                goto truncated;
+            }
+            pos += len;
+        }
+        if (count > 0) {
+            int64_t bytes = carquet_decode_plain_byte_array(p + pos, size - pos, (carquet_byte_array_t*)out, count);
+            if (bytes < 0) {
+                goto truncated;
+            }
+            pos += (size_t)bytes;
+        }
+        reader->lazy_pos = pos;
+    } else {
+        carquet_rle_decoder_t* rle = &reader->lazy_rle;
+        if (skip > 0 && carquet_rle_decoder_skip(rle, skip) != skip) {
+            goto truncated;
+        }
+        if ((size_t)count > reader->indices_capacity) {
+            carquet_mem_free(reader->indices_buffer);
+            reader->indices_buffer = carquet_mem_malloc((size_t)count * sizeof(uint32_t));
+            reader->indices_capacity = reader->indices_buffer ? (size_t)count : 0;
+            if (!reader->indices_buffer) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate indices");
+                return CARQUET_ERROR_OUT_OF_MEMORY;
+            }
+        }
+        uint32_t* indices = reader->indices_buffer;
+        if (carquet_rle_decoder_get_batch(rle, indices, count) != count) {
+            goto truncated;
+        }
+        if (reader->type == CARQUET_PHYSICAL_BYTE_ARRAY) {
+            carquet_byte_array_t* ba = (carquet_byte_array_t*)out;
+            for (int32_t i = 0; i < count; i++) {
+                if (indices[i] >= (uint32_t)reader->dictionary_count) {
+                    goto out_of_range;
+                }
+                const uint8_t* d = reader->dictionary_data + reader->dictionary_offsets[indices[i]];
+                ba[i].data = (uint8_t*)(d + 4);
+                ba[i].length = (int32_t)carquet_read_u32_le(d);
+            }
+        } else if (!gather_numeric_dictionary_values(reader, rle->bit_width, indices, count, out)) {
+            goto out_of_range;
+        }
+    }
+    reader->lazy_next = first + count;
+    return CARQUET_OK;
+
+truncated:
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Truncated page values");
+    return CARQUET_ERROR_DECODE;
+out_of_range:
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_DECODE, "Dictionary index out of bounds");
+    return CARQUET_ERROR_DECODE;
+}
+
 static carquet_status_t load_next_page_fread(
     carquet_column_reader_t* reader,
     carquet_error_t* error) {
@@ -3274,6 +3440,29 @@ static carquet_status_t load_next_page_fread(
         return status;
     }
 
+    if (!is_v2 && lazy_page_supported(reader, page_encoding)) {
+        status = start_lazy_page_v1(reader, page_data, page_size, &page_header.data_page_header, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+        /* PLAIN strings point into the page: kept as the eager path keeps it (below) */
+        if (page_encoding == CARQUET_ENCODING_PLAIN && !adopt_page_buffer(reader, page_data)) {
+            uint8_t* retained = carquet_column_retain_page(reader, page_data, page_size);
+            if (!retained) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to retain page data");
+                return CARQUET_ERROR_OUT_OF_MEMORY;
+            }
+            reader->lazy_data = retained + (reader->lazy_data - page_data);
+        }
+        reader->page_loaded = true;
+        reader->page_num_values = num_values;
+        reader->page_values_read = 0;
+        reader->dense_cursor_pos = -1;
+        reader->page_header_size = (int32_t)header_size;
+        reader->page_compressed_size = page_header.compressed_page_size;
+        return CARQUET_OK;
+    }
+
     /* Decode the entire page into our buffers */
     int64_t decoded_count;
     if (is_v2) {
@@ -3345,6 +3534,7 @@ static carquet_status_t load_next_page(
     carquet_error_t* error) {
 
     carquet_reader_t* file_reader = reader->file_reader;
+    reader->page_lazy = false;
 
     /* Use mmap/buffer path if memory-mapped or buffer-based reader */
     if (file_reader->mmap_data != NULL) {
@@ -3660,8 +3850,16 @@ carquet_status_t carquet_read_next_page(
         reader->dense_cursor_val = dense_start + values_to_copy;
     }
 
-    memcpy(values, (uint8_t*)reader->decoded_values + offset,
-           (size_t)values_to_copy * value_size);
+    if (reader->page_lazy) {
+        carquet_status_t status = read_lazy_values(reader, (int32_t)(offset / value_size),
+                                                   values_to_copy, values, error);
+        if (status != CARQUET_OK) {
+            return status;
+        }
+    } else {
+        memcpy(values, (uint8_t*)reader->decoded_values + offset,
+               (size_t)values_to_copy * value_size);
+    }
 
     if (def_levels) {
         if (def_bits) {

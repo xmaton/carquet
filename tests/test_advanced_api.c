@@ -901,6 +901,114 @@ static int test_release_pages(carquet_compression_t codec, bool use_mmap) {
     return 0;
 }
 
+/* ======================================================================
+ * Test: carquet_column_set_lazy_values()
+ *
+ * Each column is read by two readers, one decoding whole pages and one
+ * lazily, through the same skips and reads (some within a page, some across
+ * pages): the values and levels must agree. Columns: PLAIN strings, dictionary
+ * strings and dictionary int64s, with NULLs; and required dictionary int64s.
+ * ====================================================================== */
+
+#define LAZY_ROWS 30000
+static int lazy_null(int col, int i) { return col == 3 ? 0 : i % (col + 3) == 0; }
+
+static int test_lazy_values(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(NULL);
+    carquet_schema_add_column(schema, "s", CARQUET_PHYSICAL_BYTE_ARRAY, NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
+    carquet_schema_add_column(schema, "d", CARQUET_PHYSICAL_BYTE_ARRAY, NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
+    carquet_schema_add_column(schema, "n", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
+    carquet_schema_add_column(schema, "r", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_SNAPPY;
+    opts.page_size = 4096;
+    carquet_writer_t* w = carquet_writer_create(TEMP_FILE, schema, &opts, &err);
+    if (!w) TEST_FAIL("lazy_values", err.message);
+    for (int c = 1; c < 4; c++) {
+        if (carquet_writer_set_column_encoding(w, c, CARQUET_ENCODING_RLE_DICTIONARY) != CARQUET_OK)
+            TEST_FAIL("lazy_values", "set encoding failed");
+    }
+    static char strs[2][LAZY_ROWS][32];
+    static carquet_byte_array_t ss[2][LAZY_ROWS];
+    static int64_t ns[2][LAZY_ROWS];
+    static int16_t defs[4][LAZY_ROWS];
+    int dense[4] = {0};
+    for (int i = 0; i < LAZY_ROWS; i++) {
+        for (int c = 0; c < 4; c++) {
+            defs[c][i] = (int16_t)!lazy_null(c, i);
+            if (!defs[c][i]) continue;
+            int k = dense[c]++;
+            if (c < 2) {
+                ss[c][k].length = c == 0 ? snprintf(strs[c][k], 32, "plain-%d-%.*s", i, i % 11, "xxxxxxxxxxx")
+                                         : snprintf(strs[c][k], 32, "dict-%d", i % 37);
+                ss[c][k].data = (uint8_t*)strs[c][k];
+            } else {
+                ns[c - 2][k] = (int64_t)(i % 101) * 7 - c;
+            }
+        }
+    }
+    for (int c = 0; c < 4; c++) {
+        const void* v = c < 2 ? (const void*)ss[c] : (const void*)ns[c - 2];
+        if (carquet_writer_write_batch(w, c, v, LAZY_ROWS, c == 3 ? NULL : defs[c], NULL) != CARQUET_OK)
+            TEST_FAIL("lazy_values", "write failed");
+    }
+    if (carquet_writer_close(w) != CARQUET_OK) TEST_FAIL("lazy_values", "close failed");
+    carquet_schema_free(schema);
+
+    carquet_reader_options_t ropts;
+    carquet_reader_options_init(&ropts);
+    ropts.use_mmap = false;
+    carquet_reader_t* r = carquet_reader_open(TEMP_FILE, &ropts, &err);
+    if (!r) TEST_FAIL("lazy_values", err.message);
+    static carquet_byte_array_t ba[2][1000];
+    static int64_t na[2][1000];
+    static int16_t la[2][1000];
+    for (int c = 0; c < 4; c++) {
+        carquet_column_reader_t* eager = carquet_reader_get_column(r, 0, c, &err);
+        carquet_column_reader_t* lazy = carquet_reader_get_column(r, 0, c, &err);
+        if (!eager || !lazy) TEST_FAIL("lazy_values", err.message);
+        carquet_column_set_lazy_values(lazy, true);
+        uint32_t seed = 12345u + (uint32_t)c;
+        int64_t at = 0;
+        while (at < LAZY_ROWS) {
+            seed = seed * 1103515245u + 12345u;
+            int64_t n = 1 + (int64_t)((seed >> 8) % 999);
+            if ((seed >> 4) % 3 == 0) {
+                int64_t a = carquet_column_skip(eager, n), b = carquet_column_skip(lazy, n);
+                if (a != b) TEST_FAIL("lazy_values", "skips differ");
+                at += a;
+                continue;
+            }
+            carquet_column_release_pages(lazy);
+            void* va = c < 2 ? (void*)ba[0] : (void*)na[0];
+            void* vb = c < 2 ? (void*)ba[1] : (void*)na[1];
+            int64_t a = carquet_column_read_batch(eager, va, n, c == 3 ? NULL : la[0], NULL);
+            int64_t b = carquet_column_read_batch(lazy, vb, n, c == 3 ? NULL : la[1], NULL);
+            if (a != b || a <= 0) TEST_FAIL("lazy_values", "reads differ");
+            int64_t present = 0;
+            for (int64_t i = 0; i < a; i++) {
+                if (c != 3 && (la[0][i] != la[1][i] || la[0][i] != defs[c][at + i]))
+                    TEST_FAIL("lazy_values", "levels differ");
+                present += c == 3 || la[0][i];
+            }
+            for (int64_t i = 0; i < present; i++) {
+                bool same = c < 2 ? ba[0][i].length == ba[1][i].length &&
+                                    memcmp(ba[0][i].data, ba[1][i].data, (size_t)ba[0][i].length) == 0
+                                  : na[0][i] == na[1][i];
+                if (!same) TEST_FAIL("lazy_values", "values differ");
+            }
+            at += a;
+        }
+        carquet_column_reader_free(eager);
+        carquet_column_reader_free(lazy);
+    }
+    carquet_reader_close(r);
+    TEST_PASS("lazy_values");
+    return 0;
+}
+
 int main(void) {
     carquet_init();
     int failures = 0;
@@ -919,6 +1027,7 @@ int main(void) {
     failures += test_release_pages(CARQUET_COMPRESSION_UNCOMPRESSED, false);
     failures += test_release_pages(CARQUET_COMPRESSION_SNAPPY, true);
     failures += test_release_pages(CARQUET_COMPRESSION_UNCOMPRESSED, true);
+    failures += test_lazy_values();
 
     remove(TEMP_FILE);
 

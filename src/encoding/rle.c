@@ -278,6 +278,18 @@ int64_t carquet_rle_decoder_skip(
             skipped += to_skip;
             dec->run_remaining -= to_skip;
         } else {
+            /* Whole groups of 8 are passed over unread: a group is bit_width bytes */
+            if (dec->bitpack_pos >= dec->bitpack_count && to_skip >= 8) {
+                size_t groups = (size_t)(to_skip / 8);
+                size_t avail = dec->bit_width > 0 ? (dec->size - dec->pos) / (size_t)dec->bit_width : groups;
+                if (groups > avail) {
+                    groups = avail;
+                }
+                dec->pos += groups * (size_t)dec->bit_width;
+                dec->run_remaining -= (int64_t)(groups * 8);
+                skipped += (int64_t)(groups * 8);
+                to_skip -= (int64_t)(groups * 8);
+            }
             /* Need to actually advance through bit-packed data */
             while (to_skip > 0 && dec->run_remaining > 0) {
                 if (dec->bitpack_pos >= dec->bitpack_count) {

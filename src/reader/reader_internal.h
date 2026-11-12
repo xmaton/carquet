@@ -12,6 +12,7 @@
 #include <carquet/carquet.h>
 #include "thrift/parquet_types.h"
 #include "core/arena.h"
+#include "encoding/rle.h"
 #include <stdio.h>
 
 #ifdef _WIN32
@@ -216,6 +217,18 @@ struct carquet_column_reader {
 
     /* Dictionary preservation mode */
     bool preserve_dictionary;   /* If true, skip materialization, keep indices */
+
+    /* Lazy values (carquet_column_set_lazy_values): the loaded page's values
+     * are decoded as read, from a cursor, not into decoded_values. */
+    bool lazy_values;           /* the option */
+    bool page_lazy;             /* the loaded page is decoded so */
+    carquet_encoding_t lazy_encoding;
+    const uint8_t* lazy_data;   /* PLAIN: the values; dictionary: the indices */
+    size_t lazy_size;
+    size_t lazy_pos;            /* PLAIN: the next value's byte offset */
+    int32_t lazy_next;          /* dense index of the next value */
+    int32_t lazy_count;         /* dense values in the page */
+    carquet_rle_decoder_t lazy_rle; /* dictionary: at index lazy_next */
 
     /* Last failure seen by this column reader, for callers that read through an
      * API with no error out-parameter (the batch reader). Written only by the
