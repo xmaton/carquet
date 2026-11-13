@@ -94,6 +94,10 @@ struct carquet_reader {
      * readers of one file can load pages from several threads at once. */
     bool positional_io;
 
+    /* carquet_reader_open_io: every read goes through io (file is NULL) */
+    bool has_io;
+    carquet_io_t io;
+
     /* Memory-mapped data */
     const uint8_t* mmap_data;
     size_t file_size;

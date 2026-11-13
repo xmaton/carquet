@@ -163,6 +163,19 @@ static size_t prebuf_read_at(carquet_reader_t* file_reader,
         }
     }
 
+    /* An I/O source: from its memory if it holds the bytes, else read */
+    if (file_reader->has_io) {
+        const carquet_io_t* io = &file_reader->io;
+        const uint8_t* v = io->view ? io->view(io->ctx, offset, size) : NULL;
+        if (v) {
+            memcpy(buf, v, size);
+            return size;
+        }
+        carquet_error_t ignored = CARQUET_ERROR_INIT;
+        int64_t n = io->read_at(io->ctx, offset, buf, size, &ignored);
+        return n < 0 ? 0 : (size_t)n;
+    }
+
     /* Positional read when possible: it leaves the stream position alone, so
      * column readers on other threads can load their pages concurrently. */
     if (file_reader->positional_io) {
@@ -2745,7 +2758,7 @@ static carquet_status_t load_inferred_dictionary(
     if (reader->file_reader->mmap_data != NULL) {
         return load_dictionary_page_mmap_at(reader, m->data_page_offset, error);
     }
-    if (reader->file_reader->file == NULL) {
+    if (reader->file_reader->file == NULL && !reader->file_reader->has_io) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source");
         return CARQUET_ERROR_INVALID_STATE;
     }
@@ -3336,30 +3349,36 @@ static carquet_status_t load_next_page_fread(
         return status;
     }
 
-    /* Read compressed page data into a reusable buffer (from prebuffer or file) */
-    take_spare_page(reader, &reader->page_buffer, &reader->page_buffer_capacity);
-    if ((size_t)page_header.compressed_page_size > reader->page_buffer_capacity) {
-        uint8_t* new_buffer = carquet_mem_realloc(reader->page_buffer, (size_t)page_header.compressed_page_size);
-        if (!new_buffer) {
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate page buffer");
-            return CARQUET_ERROR_OUT_OF_MEMORY;
-        }
-        reader->page_buffer = new_buffer;
-        reader->page_buffer_capacity = (size_t)page_header.compressed_page_size;
-    }
-    reader->page_buffer_size = (size_t)page_header.compressed_page_size;
-    uint8_t* compressed = reader->page_buffer;
-
     int64_t page_data_offset;
     if (!checked_add_i64(page_file_offset, (int64_t)header_size, &page_data_offset)) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_PAGE, "Data page offset overflow");
         return CARQUET_ERROR_INVALID_PAGE;
     }
-    if (prebuf_read_at(file_reader, page_data_offset,
-                       compressed, page_header.compressed_page_size) !=
-        (size_t)page_header.compressed_page_size) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read page data");
-        return CARQUET_ERROR_FILE_READ;
+
+    /* The compressed page data: in place where an I/O source holds it (no copy),
+     * else read into a reusable buffer (from prebuffer or file) */
+    const carquet_io_t* io = file_reader->has_io ? &file_reader->io : NULL;
+    const uint8_t* compressed = io && io->view
+        ? io->view(io->ctx, page_data_offset, (size_t)page_header.compressed_page_size) : NULL;
+    if (!compressed) {
+        take_spare_page(reader, &reader->page_buffer, &reader->page_buffer_capacity);
+        if ((size_t)page_header.compressed_page_size > reader->page_buffer_capacity) {
+            uint8_t* new_buffer = carquet_mem_realloc(reader->page_buffer, (size_t)page_header.compressed_page_size);
+            if (!new_buffer) {
+                CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate page buffer");
+                return CARQUET_ERROR_OUT_OF_MEMORY;
+            }
+            reader->page_buffer = new_buffer;
+            reader->page_buffer_capacity = (size_t)page_header.compressed_page_size;
+        }
+        reader->page_buffer_size = (size_t)page_header.compressed_page_size;
+        compressed = reader->page_buffer;
+        if (prebuf_read_at(file_reader, page_data_offset,
+                           reader->page_buffer, page_header.compressed_page_size) !=
+            (size_t)page_header.compressed_page_size) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read page data");
+            return CARQUET_ERROR_FILE_READ;
+        }
     }
 
     /* Verify CRC32 if present */
@@ -3542,7 +3561,7 @@ static carquet_status_t load_next_page(
     }
 
     /* Fall back to fread path (requires valid file handle) */
-    if (file_reader->file == NULL) {
+    if (file_reader->file == NULL && !file_reader->has_io) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source available");
         return CARQUET_ERROR_INVALID_STATE;
     }
@@ -3599,7 +3618,7 @@ carquet_status_t carquet_column_ensure_dictionary_loaded(
     if (reader->file_reader->mmap_data != NULL) {
         return load_dictionary_page_mmap(reader, error);
     }
-    if (reader->file_reader->file == NULL) {
+    if (reader->file_reader->file == NULL && !reader->file_reader->has_io) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source");
         return CARQUET_ERROR_INVALID_STATE;
     }
@@ -3636,7 +3655,7 @@ static carquet_status_t parse_header_at_offset(
         return parquet_parse_page_header(
             file_reader->mmap_data + offset, max_hdr, hdr, hdr_size, error);
     }
-    if (file_reader->file == NULL) {
+    if (file_reader->file == NULL && !file_reader->has_io) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "No data source");
         return CARQUET_ERROR_INVALID_STATE;
     }

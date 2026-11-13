@@ -343,14 +343,20 @@ void carquet_reader_options_init(carquet_reader_options_t* options) {
  */
 #define CARQUET_FOOTER_SPECULATIVE_SIZE (64 * 1024)
 
-static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* error) {
-    /* Seek to end to get file size (64-bit aware for files >2 GiB on Windows) */
-    if (carquet_fseek64(reader->file, 0, SEEK_END) != 0) {
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to end");
-        return CARQUET_ERROR_FILE_SEEK;
-    }
+static bool reader_file_read_at(carquet_reader_t* reader, void* buf, size_t size,
+                                int64_t offset);
 
-    int64_t file_size = carquet_ftell64(reader->file);
+static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* error) {
+    /* Seek to end to get file size (64-bit aware for files >2 GiB on Windows);
+     * an I/O source gave its size when opened */
+    int64_t file_size = (int64_t)reader->file_size;
+    if (!reader->has_io) {
+        if (carquet_fseek64(reader->file, 0, SEEK_END) != 0) {
+            CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to end");
+            return CARQUET_ERROR_FILE_SEEK;
+        }
+        file_size = carquet_ftell64(reader->file);
+    }
     if (file_size < 0) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to get file size");
         return CARQUET_ERROR_FILE_READ;
@@ -384,13 +390,7 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
     }
 
     int64_t spec_offset = (int64_t)(reader->file_size - spec_size);
-    if (carquet_fseek64(reader->file, spec_offset, SEEK_SET) != 0) {
-        carquet_mem_free(spec_buf);
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to footer");
-        return CARQUET_ERROR_FILE_SEEK;
-    }
-
-    if (fread(spec_buf, 1, spec_size, reader->file) != spec_size) {
+    if (!reader_file_read_at(reader, spec_buf, spec_size, spec_offset)) {
         carquet_mem_free(spec_buf);
         CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read footer tail");
         return CARQUET_ERROR_FILE_READ;
@@ -439,14 +439,7 @@ static carquet_status_t read_footer(carquet_reader_t* reader, carquet_error_t* e
         }
 
         int64_t footer_offset = (int64_t)(reader->file_size - 8 - footer_size);
-        if (carquet_fseek64(reader->file, footer_offset, SEEK_SET) != 0) {
-            carquet_mem_free(fallback_buf);
-            carquet_mem_free(spec_buf);
-            CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_SEEK, "Failed to seek to footer data");
-            return CARQUET_ERROR_FILE_SEEK;
-        }
-
-        if (fread(fallback_buf, 1, footer_size, reader->file) != footer_size) {
+        if (!reader_file_read_at(reader, fallback_buf, footer_size, footer_offset)) {
             carquet_mem_free(fallback_buf);
             carquet_mem_free(spec_buf);
             CARQUET_SET_ERROR(error, CARQUET_ERROR_FILE_READ, "Failed to read footer data");
@@ -657,6 +650,50 @@ carquet_reader_t* carquet_reader_open_file(
     return reader;
 }
 
+carquet_reader_t* carquet_reader_open_io(
+    const carquet_io_t* io,
+    int64_t size,
+    const carquet_reader_options_t* options,
+    carquet_error_t* error) {
+
+    /* io is nonnull per API contract */
+    if (!io->read_at || size < 0 || (uint64_t)size > (uint64_t)SIZE_MAX) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_ARGUMENT,
+            "An I/O source needs read_at and a size from 0 to SIZE_MAX");
+        return NULL;
+    }
+    carquet_reader_t* reader = carquet_mem_calloc(1, sizeof(carquet_reader_t));
+    if (!reader) {
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate reader");
+        return NULL;
+    }
+    if (options) {
+        reader->options = *options;
+    } else {
+        carquet_reader_options_init(&reader->options);
+    }
+    reader->options.use_mmap = false;
+    if (carquet_arena_init(&reader->arena) != CARQUET_OK) {
+        carquet_mem_free(reader);
+        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to initialize arena");
+        return NULL;
+    }
+    reader->prebuffer.row_group = -1;
+    reader->prebuffer.file_offset = -1;
+    reader->has_io = true;
+    reader->io = *io;
+    reader->file_size = (size_t)size;
+
+    carquet_status_t status = read_footer(reader, error);
+    if (status != CARQUET_OK) {
+        carquet_arena_destroy(&reader->arena);
+        carquet_mem_free(reader);
+        return NULL;
+    }
+    reader->is_open = true;
+    return reader;
+}
+
 carquet_status_t carquet_get_file_info(
     const char* path,
     carquet_file_info_t* info,
@@ -702,6 +739,10 @@ carquet_status_t carquet_get_file_info(
  * return bytes from the wrong place. */
 static bool reader_file_read_at(carquet_reader_t* reader, void* buf, size_t size,
                                 int64_t offset) {
+    if (reader->has_io) {
+        carquet_error_t ignored = CARQUET_ERROR_INIT;
+        return reader->io.read_at(reader->io.ctx, offset, buf, size, &ignored) == (int64_t)size;
+    }
     if (reader->positional_io) {
         return carquet_file_pread(reader->file, buf, size, offset) == size;
     }
@@ -742,7 +783,7 @@ carquet_status_t carquet_validate_file(
         if (reader->mmap_data) {
             memcpy(head, reader->mmap_data, PARQUET_MAGIC_LEN);  /* size >= 12 */
             have_head = true;
-        } else if (reader->file) {
+        } else if (reader->file || reader->has_io) {
             have_head = reader_file_read_at(reader, head, PARQUET_MAGIC_LEN, 0);
         }
         if (!have_head || memcmp(head, PARQUET_MAGIC, PARQUET_MAGIC_LEN) != 0) {
@@ -872,7 +913,7 @@ carquet_status_t carquet_reader_prebuffer(
         return CARQUET_OK;
     }
 
-    if (!reader->file) {
+    if (!reader->file && !reader->has_io) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "Reader has no file handle");
         return CARQUET_ERROR_INVALID_STATE;
     }
@@ -1424,7 +1465,7 @@ static carquet_status_t reader_read_bytes(
     }
 
     /* fread path: allocate buffer and read */
-    if (!reader->file) {
+    if (!reader->file && !reader->has_io) {
         CARQUET_SET_ERROR(error, CARQUET_ERROR_INVALID_STATE, "Reader has no file handle");
         return CARQUET_ERROR_INVALID_STATE;
     }

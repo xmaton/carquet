@@ -1009,6 +1009,141 @@ static int test_lazy_values(void) {
     return 0;
 }
 
+/* ======================================================================
+ * Test: carquet_reader_open_io()
+ *
+ * A file read through an I/O source, three ways: read_at only; a view of
+ * the file's second half (pages in the first half are read, the others
+ * decompressed in place); a view of all of it. Each agrees with
+ * carquet_reader_open, eager and lazy (carquet_column_set_lazy_values).
+ * ====================================================================== */
+
+typedef struct {
+    const uint8_t* data;
+    size_t size;
+    size_t view_from; /* views only of ranges starting here or later */
+    int reads;        /* read_at calls */
+    int views;        /* view calls that returned bytes */
+} io_test_source_t;
+
+static int64_t io_test_read_at(void* ctx, int64_t offset, void* buf, size_t size, carquet_error_t* error) {
+    io_test_source_t* s = (io_test_source_t*)ctx;
+    (void)error;
+    s->reads++;
+    if (offset < 0 || (size_t)offset > s->size) return -1;
+    size_t n = s->size - (size_t)offset < size ? s->size - (size_t)offset : size;
+    memcpy(buf, s->data + offset, n);
+    return (int64_t)n;
+}
+
+static const uint8_t* io_test_view(void* ctx, int64_t offset, size_t size) {
+    io_test_source_t* s = (io_test_source_t*)ctx;
+    if (offset < 0 || (size_t)offset < s->view_from || (size_t)offset > s->size || size > s->size - (size_t)offset) {
+        return NULL;
+    }
+    s->views++;
+    return s->data + offset;
+}
+
+#define IO_ROWS 20000
+static int test_open_io(void) {
+    carquet_error_t err = CARQUET_ERROR_INIT;
+    carquet_schema_t* schema = carquet_schema_create(NULL);
+    carquet_schema_add_column(schema, "n", CARQUET_PHYSICAL_INT64, NULL, CARQUET_REPETITION_REQUIRED, 0, 0);
+    carquet_schema_add_column(schema, "s", CARQUET_PHYSICAL_BYTE_ARRAY, NULL, CARQUET_REPETITION_OPTIONAL, 0, 0);
+    carquet_writer_options_t opts;
+    carquet_writer_options_init(&opts);
+    opts.compression = CARQUET_COMPRESSION_SNAPPY;
+    opts.page_size = 4096;
+    carquet_writer_t* w = carquet_writer_create(TEMP_FILE, schema, &opts, &err);
+    if (!w) TEST_FAIL("open_io", err.message);
+    if (carquet_writer_set_column_encoding(w, 0, CARQUET_ENCODING_RLE_DICTIONARY) != CARQUET_OK)
+        TEST_FAIL("open_io", "set encoding failed");
+    static int64_t ns[IO_ROWS];
+    static char strs[IO_ROWS][32];
+    static carquet_byte_array_t ss[IO_ROWS];
+    static int16_t defs[IO_ROWS];
+    int dense = 0;
+    for (int i = 0; i < IO_ROWS; i++) {
+        ns[i] = (int64_t)(i % 97) * 3;
+        defs[i] = (int16_t)(i % 5 != 0);
+        if (defs[i]) {
+            ss[dense].length = snprintf(strs[dense], 32, "io-%d-%.*s", i, i % 9, "zzzzzzzzz");
+            ss[dense].data = (uint8_t*)strs[dense];
+            dense++;
+        }
+    }
+    if (carquet_writer_write_batch(w, 0, ns, IO_ROWS, NULL, NULL) != CARQUET_OK ||
+        carquet_writer_write_batch(w, 1, ss, IO_ROWS, defs, NULL) != CARQUET_OK ||
+        carquet_writer_close(w) != CARQUET_OK)
+        TEST_FAIL("open_io", "write failed");
+    carquet_schema_free(schema);
+
+    FILE* f = fopen(TEMP_FILE, "rb");
+    if (!f) TEST_FAIL("open_io", "cannot reopen file");
+    fseek(f, 0, SEEK_END);
+    size_t size = (size_t)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t* bytes = (uint8_t*)malloc(size);
+    if (!bytes || fread(bytes, 1, size, f) != size) TEST_FAIL("open_io", "cannot read file");
+    fclose(f);
+
+    carquet_reader_options_t ropts;
+    carquet_reader_options_init(&ropts);
+    ropts.use_mmap = false;
+    carquet_reader_t* plain = carquet_reader_open(TEMP_FILE, &ropts, &err);
+    if (!plain) TEST_FAIL("open_io", err.message);
+
+    static int64_t na[2][IO_ROWS];
+    static carquet_byte_array_t sa[2][IO_ROWS];
+    static int16_t la[2][IO_ROWS];
+    size_t view_from[3] = { (size_t)-1, size / 2, 0 };
+    for (int mode = 0; mode < 3; mode++) {
+        io_test_source_t src = { bytes, size, view_from[mode], 0, 0 };
+        carquet_io_t io = { &src, io_test_read_at, mode == 0 ? NULL : io_test_view };
+        carquet_reader_t* r = carquet_reader_open_io(&io, (int64_t)size, &ropts, &err);
+        if (!r) TEST_FAIL("open_io", err.message);
+        if (carquet_reader_num_rows(r) != IO_ROWS) TEST_FAIL("open_io", "row count");
+        for (int lazy = 0; lazy < 2; lazy++) {
+            for (int c = 0; c < 2; c++) {
+                carquet_column_reader_t* a = carquet_reader_get_column(plain, 0, c, &err);
+                carquet_column_reader_t* b = carquet_reader_get_column(r, 0, c, &err);
+                if (!a || !b) TEST_FAIL("open_io", err.message);
+                carquet_column_set_lazy_values(b, lazy != 0);
+                void* va = c == 0 ? (void*)na[0] : (void*)sa[0];
+                void* vb = c == 0 ? (void*)na[1] : (void*)sa[1];
+                /* a skip into the middle, then the rest in one read */
+                if (carquet_column_skip(a, 777) != 777 || carquet_column_skip(b, 777) != 777)
+                    TEST_FAIL("open_io", "skip");
+                int64_t ra = carquet_column_read_batch(a, va, IO_ROWS, c ? la[0] : NULL, NULL);
+                int64_t rb = carquet_column_read_batch(b, vb, IO_ROWS, c ? la[1] : NULL, NULL);
+                if (ra != IO_ROWS - 777 || rb != ra) TEST_FAIL("open_io", "reads differ");
+                int64_t present = c ? 0 : ra;
+                for (int64_t i = 0; c && i < ra; i++) {
+                    if (la[0][i] != la[1][i]) TEST_FAIL("open_io", "levels differ");
+                    present += la[0][i];
+                }
+                for (int64_t i = 0; i < present; i++) {
+                    bool same = c == 0 ? na[0][i] == na[1][i]
+                                       : sa[0][i].length == sa[1][i].length &&
+                                         memcmp(sa[0][i].data, sa[1][i].data, (size_t)sa[0][i].length) == 0;
+                    if (!same) TEST_FAIL("open_io", "values differ");
+                }
+                carquet_column_reader_free(a);
+                carquet_column_reader_free(b);
+            }
+        }
+        /* without a view every read is a read_at; with one, pages come from it */
+        if (mode == 0 && (src.views != 0 || src.reads == 0)) TEST_FAIL("open_io", "read_at only: views used");
+        if (mode > 0 && src.views == 0) TEST_FAIL("open_io", "no page read from a view");
+        carquet_reader_close(r);
+    }
+    carquet_reader_close(plain);
+    free(bytes);
+    TEST_PASS("open_io");
+    return 0;
+}
+
 int main(void) {
     carquet_init();
     int failures = 0;
@@ -1028,6 +1163,7 @@ int main(void) {
     failures += test_release_pages(CARQUET_COMPRESSION_SNAPPY, true);
     failures += test_release_pages(CARQUET_COMPRESSION_UNCOMPRESSED, true);
     failures += test_lazy_values();
+    failures += test_open_io();
 
     remove(TEMP_FILE);
 

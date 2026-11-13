@@ -451,9 +451,10 @@ static size_t get_type_size(carquet_physical_type_t type, int32_t type_length) {
 }
 
 /* Column readers of this file can load pages from several threads at once:
- * the file is mapped, or read with positional I/O (see positional_io). */
+ * the file is mapped, read with positional I/O (see positional_io), or an
+ * I/O source (whose functions may be called from several threads). */
 static bool br_parallel_io(const carquet_reader_t* reader) {
-    return reader->mmap_data != NULL || reader->positional_io;
+    return reader->mmap_data != NULL || reader->positional_io || reader->has_io;
 }
 
 static int resolve_column_name(const carquet_reader_t* reader, const char* name) {

@@ -1434,6 +1434,50 @@ carquet_reader_t* carquet_reader_open_buffer(
     carquet_error_t* error);
 
 /**
+ * @brief Where a reader opened with carquet_reader_open_io gets its bytes.
+ *
+ * For sources carquet cannot open itself: a cache, an object store, an
+ * archive. Both functions may be called from several threads at once (the
+ * column readers of one reader load pages concurrently).
+ */
+typedef struct carquet_io {
+    /** Passed to the functions. */
+    void* ctx;
+    /**
+     * Read size bytes at offset into buf. Returns the bytes read, fewer only
+     * at the end of the source, or -1 on failure (with error set).
+     */
+    int64_t (*read_at)(void* ctx, int64_t offset, void* buf, size_t size, carquet_error_t* error);
+    /**
+     * Optional (may be NULL): the size bytes at offset where the source holds
+     * them in memory, or NULL if it does not (then read_at is used). A page
+     * read from a view is decompressed straight from it, with no copy, and an
+     * uncompressed page's values may point into it: the bytes must stay valid
+     * while a column reader is on that page (until it moves past it, is reset
+     * or is freed).
+     */
+    const uint8_t* (*view)(void* ctx, int64_t offset, size_t size);
+} carquet_io_t;
+
+/**
+ * @brief Open a Parquet reader on an I/O source.
+ *
+ * @param[in] io The source (copied; ctx must outlive the reader)
+ * @param[in] size The source's size in bytes
+ * @param[in] options Reader options (may be NULL; use_mmap is ignored)
+ * @param[out] error Error information (may be NULL)
+ * @return Reader handle, or NULL on error
+ *
+ * @note Thread-safe: Yes
+ */
+CARQUET_API CARQUET_WARN_UNUSED_RESULT CARQUET_NONNULL(1)
+carquet_reader_t* carquet_reader_open_io(
+    const carquet_io_t* io,
+    int64_t size,
+    const carquet_reader_options_t* options,
+    carquet_error_t* error);
+
+/**
  * @brief Close a reader and release all resources.
  *
  * Closes the file (if opened by carquet_reader_open) and frees all memory
