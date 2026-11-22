@@ -141,6 +141,7 @@ typedef struct carquet_retained_page {
 #define CARQUET_LAZY_PLAIN 1    /* little-endian values, as they are */
 #define CARQUET_LAZY_BSS 2      /* BYTE_STREAM_SPLIT planes (FLOAT / DOUBLE) */
 #define CARQUET_LAZY_DICT 3     /* RLE / bit-packed dictionary indices */
+#define CARQUET_LAZY_BYTE_ARRAY 4 /* PLAIN byte arrays, each after its length */
 
 struct carquet_column_reader {
     carquet_reader_t* file_reader;
@@ -231,6 +232,7 @@ struct carquet_column_reader {
                                  * RLE index stream (past its width byte) */
     size_t lazy_size;
     int32_t lazy_pos;           /* dense values drawn so far */
+    size_t lazy_offset;         /* CARQUET_LAZY_BYTE_ARRAY: byte offset of value lazy_pos */
     carquet_rle_decoder_t lazy_rle;   /* positioned at lazy_pos */
     void* direct_target;        /* Set only inside carquet_read_next_page():
                                  * the caller's buffer, for a page that fits it */
@@ -254,6 +256,11 @@ struct carquet_column_reader {
 
     /* Dictionary preservation mode */
     bool preserve_dictionary;   /* If true, skip materialization, keep indices */
+
+    /* carquet_column_set_lazy_values: a flat column's pages are left
+     * dense_indices, and carquet_read_next_page() decodes only the values it
+     * returns, from the lazy_* cursor */
+    bool lazy_values;
 
     /* Last failure seen by this column reader, for callers that read through an
      * API with no error out-parameter (the batch reader). Written only by the

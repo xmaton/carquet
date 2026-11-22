@@ -1783,6 +1783,23 @@ CARQUET_API CARQUET_NONNULL(1)
 void carquet_column_release_pages(carquet_column_reader_t* reader);
 
 /**
+ * @brief Decode a page's values only as they are read.
+ *
+ * With it on, a v1 data page in PLAIN byte-array or dictionary encoding has
+ * its levels decoded when it is loaded and its values only when read: a skip
+ * within the page decodes nothing, and values never read are never decoded.
+ * Only carquet_column_read_batch(_ex) and carquet_column_skip may be used on
+ * such a reader. Other pages and encodings are decoded whole, as without it.
+ *
+ * @param[in] reader Column reader
+ * @param[in] on Whether to decode lazily (from the next page loaded)
+ *
+ * @note Thread-safe: No
+ */
+CARQUET_API CARQUET_NONNULL(1)
+void carquet_column_set_lazy_values(carquet_column_reader_t* reader, bool on);
+
+/**
  * @brief Check if there are more values to read.
  *
  * @param[in] reader Column reader
