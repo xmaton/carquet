@@ -161,7 +161,7 @@ static void free_all(void** blocks, int n) {
 
 void* carquet_mem_pool_try_take(size_t size, size_t* capacity) {
 #ifdef POOL_HAVE_LOCK
-    if (size < CARQUET_MEM_POOL_MIN_BLOCK || g_pool_count == 0) return NULL;
+    if (size < CARQUET_MEM_POOL_MIN_BLOCK) return NULL;
     void* stale[CARQUET_MEM_POOL_SLOTS];
     time_t now = time(NULL);
     void* found = NULL;
